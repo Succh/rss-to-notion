@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 RSS to Notion - 自动抓取 RSS 并推送到 Notion
-新增: AI 摘要 + 自动清理旧文章
+新增: AI 摘要 + 自动清理 + 图片提取 + 全文内容
 """
 
 import hashlib
@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 import requests
 import yaml
+from bs4 import BeautifulSoup
+from readability import Document
 
 # ========== 配置 ==========
 WORKSPACE = Path(__file__).parent
@@ -51,14 +53,86 @@ def save_state(state):
 
 
 def make_fingerprint(url: str) -> str:
-    return hashlib.md5(url.encode()).hexdigest()
+    return hashlib.md5(url.encode()).hexstrip()
 
 
 def strip_html(text: str) -> str:
     if not text:
         return ""
-    clean = re.sub(r"<[^>]+>", "", text)
-    return re.sub(r"\s+", " ", clean).strip()[:800]
+    soup = BeautifulSoup(text, "html.parser")
+    return soup.get_text(separator=" ", strip=True)[:1000]
+
+
+def extract_images(html: str, base_url: str = "") -> list:
+    """从 HTML 中提取所有图片 URL"""
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    imgs = []
+    for img in soup.find_all("img"):
+        src = img.get("src", "") or img.get("data-src", "") or img.get("data-original", "")
+        if src:
+            # 处理相对 URL
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/") and base_url:
+                parsed = urlparse(base_url)
+                src = f"{parsed.scheme}://{parsed.netloc}{src}"
+            if src.startswith("http"):
+                imgs.append(src)
+    # 去重
+    return list(dict.fromkeys(imgs))[:5]  # 最多5张
+
+
+def extract_text(html: str) -> str:
+    """从 HTML 中提取纯文本"""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    # 移除 script 和 style
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n", strip=True)
+    # 清理空行
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    return "\n".join(lines)[:2000]
+
+
+def fetch_full_content(url: str) -> tuple:
+    """从原文链接提取全文内容和图片"""
+    if not url:
+        return "", []
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = requests.get(url, timeout=15, headers=headers)
+        if r.status_code != 200:
+            return "", []
+        
+        doc = Document(r.text)
+        title = doc.short_title()
+        summary = doc.summary()
+        
+        # 提取图片
+        soup = BeautifulSoup(r.text, "html.parser")
+        imgs = []
+        # 优先取 og:image
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            imgs.append(og["content"])
+        # 再取 article 内的图片
+        article = soup.find("article") or soup.find("main") or soup.find("body")
+        if article:
+            for img in article.find_all("img")[:5]:
+                src = img.get("src", "") or img.get("data-src", "")
+                if src and src.startswith("http") and src not in imgs:
+                    imgs.append(src)
+        
+        # 提取正文文本
+        text = extract_text(summary)
+        
+        return text[:2000], imgs[:5]
+    except Exception as e:
+        return "", []
 
 
 def parse_date(date_str: str) -> str:
@@ -78,12 +152,10 @@ def parse_date(date_str: str) -> str:
 
 # ========== AI 摘要 ==========
 def generate_summary(title: str, content: str) -> str:
-    """使用 DeepSeek API 生成中文摘要"""
+    """使用 DeepSeek API 生成中文摘要，失败时降级到提取式摘要"""
     if not AI_API_KEY:
-        # 无 API 时使用提取式摘要
         return extractive_summary(content)
     
-    # 清理内容
     clean_content = strip_html(content)
     if len(clean_content) > 3000:
         clean_content = clean_content[:3000]
@@ -96,7 +168,7 @@ def generate_summary(title: str, content: str) -> str:
 
     try:
         resp = requests.post(
-            AI_API_URL,
+            AI_API_KEY and AI_API_URL or "https://api.deepseek.com/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {AI_API_KEY}",
                 "Content-Type": "application/json"
@@ -115,16 +187,12 @@ def generate_summary(title: str, content: str) -> str:
         if resp.status_code == 200:
             result = resp.json()
             summary = result["choices"][0]["message"]["content"].strip()
-            # 限制长度
-            max_len = 120
-            if len(summary) > max_len:
-                summary = summary[:max_len] + "..."
+            if len(summary) > 120:
+                summary = summary[:120] + "..."
             return summary
         else:
-            print(f"  ⚠️ AI API 错误: {resp.status_code}")
             return extractive_summary(content)
     except Exception as e:
-        print(f"  ⚠️ AI 摘要失败: {e}")
         return extractive_summary(content)
 
 
@@ -134,11 +202,9 @@ def extractive_summary(content: str) -> str:
     if not clean:
         return "暂无摘要"
     
-    # 按句子分割
     sentences = re.split(r'[。！？.!?]', clean)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
     
-    # 取前两句
     summary = "。".join(sentences[:2])
     if len(summary) > 120:
         summary = summary[:120] + "..."
@@ -165,11 +231,21 @@ def fetch_rss(url: str) -> list:
             if link is not None:
                 link = link.get("href", "") or link.text or ""
             desc = item.findtext("description", "") or item.findtext(".//{http://www.w3.org/2005/Atom}summary", "") or ""
+            content_encoded = item.findtext(".//{http://purl.org/rss/1.0/modules/content/}encoded", "") or ""
             pub_date = item.findtext("pubDate", "") or item.findtext(".//{http://www.w3.org/2005/Atom}published", "") or ""
+            
+            # 提取图片
+            html_content = desc + content_encoded
+            images = extract_images(html_content, url)
+            # 提取文本
+            text = extract_text(content_encoded) or extract_text(desc)
+            
             results.append({
                 "title": (title or "").strip(),
                 "link": (link or "").strip(),
                 "description": desc,
+                "text": text,
+                "images": images,
                 "date": parse_date(pub_date)
             })
         return results
@@ -193,7 +269,7 @@ def get_notion_database(database_id: str):
 
 
 def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
-    """创建 Notion 页面"""
+    """创建 Notion 页面（含图片和全文）"""
     properties = {
         "Title": {"title": [{"text": {"content": item["title"]}}]},
         "URL": {"url": item["link"]},
@@ -201,30 +277,61 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
         "Published": {"date": {"start": item["date"]}}
     }
     
-    # 如果有摘要，添加到页面内容
+    # 如果有摘要，添加属性
     summary = item.get("summary", "")
+    if summary:
+        properties["AI Summary"] = {"rich_text": [{"text": {"content": summary}}]}
     
+    # 构建页面内容块
     children = []
+    
+    # 1. 摘要 Callout
     if summary:
         children.append({
             "object": "block",
             "type": "callout",
             "callout": {
-                "rich_text": [{"text": {"content": f"📝 AI Summary: {summary}"}}],
+                "rich_text": [{"text": {"content": f"📝 AI 摘要: {summary}"}}],
                 "icon": {"emoji": "🤖"},
                 "color": "blue_background"
             }
         })
-        # 同时添加到属性
-        properties["AI Summary"] = {"rich_text": [{"text": {"content": summary}}]}
     
-    # 添加原文链接按钮
+    # 2. 图片（如果有）
+    images = item.get("images", [])
+    for img_url in images[:3]:  # 最多3张
+        children.append({
+            "object": "block",
+            "type": "image",
+            "image": {"type": "external", "external": {"url": img_url}}
+        })
+    
+    # 3. 正文内容（如果有）
+    text = item.get("text", "")
+    if text:
+        # 分段，每段不超过2000字符
+        paragraphs = text.split("\n")
+        for para in paragraphs:
+            if para.strip():
+                children.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [{"text": {"content": para.strip()[:2000]}}]
+                    }
+                })
+    
+    # 4. 阅读原文按钮
+    children.append({
+        "object": "block",
+        "type": "divider"
+    })
     children.append({
         "object": "block",
         "type": "paragraph",
         "paragraph": {
             "rich_text": [
-                {"text": {"content:": "📖 "}},
+                {"text": {"content": "📖 "}},
                 {"text": {"content": "阅读原文", "link": {"url": item["link"]}}}
             ]
         }
@@ -262,7 +369,6 @@ def cleanup_old_pages(database_id: str, days: int = 30) -> int:
     next_cursor = None
     
     while has_more:
-        # 查询旧文章
         payload = {
             "filter": {
                 "property": "Published",
@@ -293,7 +399,6 @@ def cleanup_old_pages(database_id: str, days: int = 30) -> int:
             
             for page in pages:
                 page_id = page["id"]
-                # 归档（软删除）
                 try:
                     archive_resp = requests.patch(
                         f"{NOTION_API}/pages/{page_id}",
@@ -422,7 +527,7 @@ def main():
     if ai_enabled:
         print(f"\n🤖 正在生成 AI 摘要...")
         for i, item in enumerate(new_items, 1):
-            summary = generate_summary(item["title"], item["description"])
+            summary = generate_summary(item["title"], item.get("text", "") + item.get("description", ""))
             item["summary"] = summary
             print(f"  [{i}/{len(new_items)}] {item['title'][:40]}... -> {summary[:30]}...")
 
@@ -430,6 +535,8 @@ def main():
     success = 0
     for i, item in enumerate(new_items, 1):
         print(f"\n[{i}/{len(new_items)}] {item['title'][:50]}")
+        print(f"  📷 图片: {len(item.get('images', []))} 张")
+        print(f"  📝 内容: {len(item.get('text', ''))} 字")
         if create_notion_page(database_id, item, item["source_name"]):
             record_item(state, item["link"])
             success += 1
