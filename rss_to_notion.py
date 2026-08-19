@@ -53,7 +53,7 @@ def save_state(state):
 
 
 def make_fingerprint(url: str) -> str:
-    return hashlib.md5(url.encode()).hexstrip()
+    return hashlib.md5(url.encode()).hexdigest()
 
 
 def strip_html(text: str) -> str:
@@ -227,9 +227,11 @@ def fetch_rss(url: str) -> list:
         results = []
         for item in items:
             title = item.findtext("title", "") or item.findtext(".//{http://www.w3.org/2005/Atom}title", "")
-            link = item.findtext("link", "") or item.find(".//{http://www.w3.org/2005/Atom}link")
-            if link is not None:
-                link = link.get("href", "") or link.text or ""
+            link_elem = item.find(".//{http://www.w3.org/2005/Atom}link")
+            if link_elem is not None:
+                link = link_elem.get("href", "") or link_elem.text or ""
+            else:
+                link = item.findtext("link", "") or ""
             desc = item.findtext("description", "") or item.findtext(".//{http://www.w3.org/2005/Atom}summary", "") or ""
             content_encoded = item.findtext(".//{http://purl.org/rss/1.0/modules/content/}encoded", "") or ""
             pub_date = item.findtext("pubDate", "") or item.findtext(".//{http://www.w3.org/2005/Atom}published", "") or ""
