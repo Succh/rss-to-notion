@@ -1,0 +1,74 @@
+# RSS to Notion - 自动推送工作流
+# 免费运行在 GitHub Actions，无需服务器
+
+name: RSS to Notion
+
+on:
+  # 定时触发（可自由修改频率）
+  schedule:
+    # 每 2 小时运行一次（整点）
+    - cron: "0 */2 * * *"
+  
+  # 允许手动触发（方便测试）
+  workflow_dispatch:
+
+  # push 时触发（方便调试）
+  # push:
+  #   branches: [main]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      
+      - name: 运行 RSS 推送
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+        run: python rss_to_notion.py
+      
+      - name: 保存推送状态
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: state
+          path: state.json
+          retention-days: 90
+
+  # 持久化 state 文件（每次运行后更新）
+  save-state:
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 下载最新 state
+        uses: actions/download-artifact@v4
+        with:
+          name: state
+          path: .
+        continue-on-error: true
+      
+      - name: 提交 state 文件
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add state.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update state.json"
+          git push
+        continue-on-error: true
