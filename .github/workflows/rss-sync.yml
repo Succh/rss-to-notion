@@ -1,5 +1,6 @@
 # RSS to Notion - 自动推送工作流
 # 免费运行在 GitHub Actions，无需服务器
+# 新增: AI 摘要 + 自动清理
 
 name: RSS to Notion
 
@@ -11,10 +12,6 @@ on:
   
   # 允许手动触发（方便测试）
   workflow_dispatch:
-
-  # push 时触发（方便调试）
-  # push:
-  #   branches: [main]
 
 jobs:
   run:
@@ -37,6 +34,7 @@ jobs:
       - name: 运行 RSS 推送
         env:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
         run: python rss_to_notion.py
       
       - name: 保存推送状态
