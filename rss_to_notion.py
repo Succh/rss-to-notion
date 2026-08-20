@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-RSS to Notion - 自动抓取 RSS 并推送到 Notion
-新增: AI 摘要 + 自动清理 + 图片提取 + 全文内容
+RSS to Notion - 通过 rss2json.com 代理抓取 RSS（绕过 GFW）
+支持 IT之家、少数派、钛媒体等国内源
 """
 
 import hashlib
@@ -23,278 +23,205 @@ WORKSPACE = Path(__file__).parent
 CONFIG_FILE = WORKSPACE / "config.yaml"
 STATE_FILE = WORKSPACE / "state.json"
 
-# Notion API
 NOTION_TOKEN = os.environ.get("NOTION_API_KEY", "")
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
+RSS2JSON_API = "https://api.rss2json.com/v1/api.json"
 
-# AI API (DeepSeek)
-AI_API_KEY = os.environ.get("AI_API_KEY", "")
-AI_API_URL = "https://api.deepseek.com/v1/chat/completions"
-AI_MODEL = "deepseek-chat"
-
-
-def load_config():
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
 
 
-def load_state():
-    if STATE_FILE.exists():
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"items": {}, "last_run": None}
+# ========== RSS 抓取（通过 rss2json 代理） ==========
+
+def fetch_rss_via_proxy(url: str) -> list:
+    """通过 rss2json.com 代理抓取 RSS，解决 GFW 问题"""
+    params = {"rss_url": url, "count": 20}
+    try:
+        r = requests.get(RSS2JSON_API, params=params, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        
+        if data.get("status") != "ok":
+            print(f"  ⚠️ rss2json 返回错误: {data.get('message', '未知')}")
+            return []
+        
+        items = []
+        for entry in data.get("items", []):
+            # 提取图片（从 content HTML 中）
+            content_html = entry.get("content", "") or ""
+            images = []
+            if content_html:
+                soup = BeautifulSoup(content_html, "html.parser")
+                for img in soup.find_all("img"):
+                    src = img.get("src") or img.get("data-src") or ""
+                    if src and src.startswith("http"):
+                        images.append(src)
+            
+            # 提取纯文本
+            text = ""
+            if content_html:
+                soup = BeautifulSoup(content_html, "html.parser")
+                text = soup.get_text(separator="\n", strip=True)
+            
+            # 解析发布时间
+            pub_date = entry.get("pubDate", "")
+            
+            item = {
+                "title": entry.get("title", ""),
+                "link": entry.get("link", ""),
+                "description": entry.get("description", "") or "",
+                "text": text,
+                "images": images[:5],
+                "pub_date": pub_date,
+                "author": entry.get("author", ""),
+            }
+            
+            if item["title"] and item["link"]:
+                items.append(item)
+        
+        return items
+        
+    except requests.exceptions.Timeout:
+        print(f"  ⏰ rss2json 超时: {url}")
+        return []
+    except Exception as e:
+        print(f"  ❌ rss2json 错误: {e}")
+        return []
 
 
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+def fetch_rss_direct(url: str) -> list:
+    """直接抓取 RSS（用于海外源）"""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+    except Exception as e:
+        print(f"  ❌ 直接抓取失败: {e}")
+        return []
+
+    channel = root.find("channel")
+    if channel is None:
+        return []
+
+    items = []
+    for item in channel.findall("item")[:10]:
+        title = item.findtext("title", "").strip()
+        link = item.findtext("link", "").strip()
+        desc = item.findtext("description", "") or ""
+
+        images = extract_images(desc)
+        text = extract_text(desc)
+
+        pub_date = item.findtext("pubDate", "")
+
+        if title and link:
+            items.append({
+                "title": title,
+                "link": link,
+                "description": desc,
+                "text": text,
+                "images": images[:5],
+                "pub_date": pub_date,
+                "author": "",
+            })
+
+    return items
 
 
-def make_fingerprint(url: str) -> str:
-    return hashlib.md5(url.encode()).hexdigest()
+def fetch_rss(url: str, use_proxy: bool = True) -> list:
+    """智能抓取：默认通过 rss2json 代理，失败则直接抓取"""
+    if use_proxy:
+        items = fetch_rss_via_proxy(url)
+        if items:
+            return items
+        print(f"  📡 代理失败，尝试直接抓取...")
+    return fetch_rss_direct(url)
 
 
-def strip_html(text: str) -> str:
-    if not text:
-        return ""
-    soup = BeautifulSoup(text, "html.parser")
-    return soup.get_text(separator=" ", strip=True)[:1000]
+# ========== 内容提取 ==========
 
-
-def extract_images(html: str, base_url: str = "") -> list:
-    """从 HTML 中提取所有图片 URL"""
+def extract_images(html: str) -> list:
     if not html:
         return []
     soup = BeautifulSoup(html, "html.parser")
-    imgs = []
+    images = []
     for img in soup.find_all("img"):
-        src = img.get("src", "") or img.get("data-src", "") or img.get("data-original", "")
-        if src:
-            # 处理相对 URL
-            if src.startswith("//"):
-                src = "https:" + src
-            elif src.startswith("/") and base_url:
-                parsed = urlparse(base_url)
-                src = f"{parsed.scheme}://{parsed.netloc}{src}"
-            if src.startswith("http"):
-                imgs.append(src)
-    # 去重
-    return list(dict.fromkeys(imgs))[:5]  # 最多5张
+        src = img.get("src") or img.get("data-src") or ""
+        if src and src.startswith("http") and not any(
+            x in src for x in ["avatar", "icon", "logo", "emoji", "tracking", "pixel"]
+        ):
+            images.append(src)
+    return list(dict.fromkeys(images))  # 去重
 
 
 def extract_text(html: str) -> str:
-    """从 HTML 中提取纯文本"""
     if not html:
         return ""
     soup = BeautifulSoup(html, "html.parser")
-    # 移除 script 和 style
-    for tag in soup(["script", "style"]):
+    for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
     text = soup.get_text(separator="\n", strip=True)
-    # 清理空行
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    return "\n".join(lines)[:2000]
-
-
-def fetch_full_content(url: str) -> tuple:
-    """从原文链接提取全文内容和图片"""
-    if not url:
-        return "", []
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        r = requests.get(url, timeout=15, headers=headers)
-        if r.status_code != 200:
-            return "", []
-        
-        html = r.text
-        
-        # 提取图片 - 优先 og:image
-        soup = BeautifulSoup(html, "html.parser")
-        imgs = []
-        
-        # Open Graph 图片
-        og = soup.find("meta", property="og:image")
-        if og and og.get("content"):
-            imgs.append(og["content"])
-        
-        # 文章区域图片
-        article = soup.find("article") or soup.find("main") or soup.find("div", class_="content") or soup.find("body")
-        if article:
-            for img in article.find_all("img")[:5]:
-                src = img.get("src", "") or img.get("data-src", "") or img.get("data-original", "")
-                if src and src.startswith("http") and src not in imgs:
-                    # 过滤掉小图标和头像
-                    if not any(x in src.lower() for x in ["avatar", "icon", "logo", "emoji", "1x1", "pixel"]):
-                        imgs.append(src)
-        
-        # 提取正文
-        # 移除 script, style, nav, footer, header
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-            tag.decompose()
-        
-        # 尝试找到文章主体
-        article = soup.find("article") or soup.find("main") or soup.find("div", class_=re.compile("content|article|post")) or soup.find("body")
-        text = extract_text(str(article)) if article else ""
-        
-        return text[:2000], imgs[:5]
-    except Exception as e:
-        return "", []
-
-
-def parse_date(date_str: str) -> str:
-    """解析 RSS 日期格式"""
-    if not date_str:
-        return datetime.utcnow().isoformat()[:10]
-    try:
-        dt = datetime.strptime(date_str.strip()[:25], "%a, %d %b %Y %H:%M:%S")
-        return dt.isoformat()[:10]
-    except:
-        pass
-    try:
-        return date_str[:10]
-    except:
-        return datetime.utcnow().isoformat()[:10]
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # 过滤导航类文本
+    lines = [l for l in lines if len(l) > 5 or re.search(r"[\u4e00-\u9fff]", l)]
+    return "\n".join(lines)
 
 
 # ========== AI 摘要 ==========
+
 def generate_summary(title: str, content: str) -> str:
-    """使用 DeepSeek API 生成中文摘要，失败时降级到提取式摘要"""
-    if not AI_API_KEY:
-        return extractive_summary(content)
-    
-    clean_content = strip_html(content)
-    if len(clean_content) > 3000:
-        clean_content = clean_content[:3000]
-    
-    prompt = f"""请为以下文章生成一段简洁的中文摘要（80-120字），概括核心要点。
-只输出摘要内容，不要任何前缀或解释。
-
-标题: {title}
-内容: {clean_content}"""
-
-    try:
-        resp = requests.post(
-            AI_API_KEY and AI_API_URL or "https://api.deepseek.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {AI_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": AI_MODEL,
-                "messages": [
-                    {"role": "system", "content": "你是一个专业的文章摘要助手。请用简洁的中文概括文章核心内容，80-120字。"},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": 200,
-                "temperature": 0.7
-            },
-            timeout=30
-        )
-        if resp.status_code == 200:
-            result = resp.json()
-            summary = result["choices"][0]["message"]["content"].strip()
-            if len(summary) > 120:
-                summary = summary[:120] + "..."
-            return summary
-        else:
-            return extractive_summary(content)
-    except Exception as e:
-        return extractive_summary(content)
+    if not content or len(content.strip()) < 20:
+        return f"📌 {title}"
+    # 提取前 200 字
+    summary = content[:200].strip()
+    if len(content) > 200:
+        summary += "..."
+    return summary
 
 
-def extractive_summary(content: str) -> str:
-    """提取式摘要（备用方案）"""
-    clean = strip_html(content)
-    if not clean:
-        return "暂无摘要"
-    
-    sentences = re.split(r'[。！？.!?]', clean)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-    
-    summary = "。".join(sentences[:2])
-    if len(summary) > 120:
-        summary = summary[:120] + "..."
-    return summary if summary else "暂无摘要"
+# ========== Notion API ==========
 
-
-# ========== RSS 抓取 ==========
-def fetch_rss(url: str) -> list:
-    """抓取 RSS 源"""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    try:
-        r = requests.get(url, timeout=15, headers=headers)
-        if r.status_code != 200:
-            print(f"  ⚠️ HTTP {r.status_code}")
-            return []
-        root = ET.fromstring(r.content)
-        items = root.findall(".//item")
-        if not items:
-            items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
-        results = []
-        for item in items:
-            title = item.findtext("title", "") or item.findtext(".//{http://www.w3.org/2005/Atom}title", "")
-            link_elem = item.find(".//{http://www.w3.org/2005/Atom}link")
-            if link_elem is not None:
-                link = link_elem.get("href", "") or link_elem.text or ""
-            else:
-                link = item.findtext("link", "") or ""
-            desc = item.findtext("description", "") or item.findtext(".//{http://www.w3.org/2005/Atom}summary", "") or ""
-            content_encoded = item.findtext(".//{http://purl.org/rss/1.0/modules/content/}encoded", "") or ""
-            pub_date = item.findtext("pubDate", "") or item.findtext(".//{http://www.w3.org/2005/Atom}published", "") or ""
-            
-            # 提取图片
-            html_content = desc + content_encoded
-            images = extract_images(html_content, url)
-            # 提取文本
-            text = extract_text(content_encoded) or extract_text(desc)
-            
-            results.append({
-                "title": (title or "").strip(),
-                "link": (link or "").strip(),
-                "description": desc,
-                "text": text,
-                "images": images,
-                "date": parse_date(pub_date)
-            })
-        return results
-    except Exception as e:
-        print(f"  ⚠️ 抓取失败: {e}")
-        return []
-
-
-# ========== Notion 操作 ==========
-def get_notion_database(database_id: str):
-    """验证 Notion 数据库"""
-    resp = requests.get(
-        f"{NOTION_API}/databases/{database_id}",
-        headers={
-            "Authorization": f"Bearer {NOTION_TOKEN}",
-            "Notion-Version": NOTION_VERSION
-        }
-    )
-    resp.raise_for_status()
-    return resp.json()
+def get_notion_headers():
+    return {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": NOTION_VERSION,
+    }
 
 
 def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
-    """创建 Notion 页面（含图片和全文）"""
+    summary = generate_summary(item["title"], item.get("text", ""))
+    item["summary"] = summary
+
+    # 清理标题中的非法字符
+    title = re.sub(r'[\n\r\t]', ' ', item["title"])[:200]
+
     properties = {
-        "Title": {"title": [{"text": {"content": item["title"]}}]},
-        "URL": {"url": item["link"]},
+        "Title": {"title": [{"text": {"content": title}}]},
         "Source": {"rich_text": [{"text": {"content": source_name}}]},
-        "Published": {"date": {"start": item["date"]}}
     }
-    
-    # 如果有摘要，添加属性
-    summary = item.get("summary", "")
+
+    if item.get("pub_date"):
+        try:
+            dt = datetime.strptime(item["pub_date"], "%a, %d %b %Y %H:%M:%S %z")
+            properties["Published"] = {"date": {"start": dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")}}
+        except:
+            try:
+                dt = datetime.fromisoformat(item["pub_date"].replace("Z", "+00:00"))
+                properties["Published"] = {"date": {"start": dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")}}
+            except:
+                pass
+
     if summary:
-        properties["AI Summary"] = {"rich_text": [{"text": {"content": summary}}]}
-    
-    # 构建页面内容块
+        properties["AI Summary"] = {"rich_text": [{"text": {"content": summary[:2000]}}]}
+
+    # 构建页面块
     children = []
-    
-    # 1. 摘要 Callout
+
+    # 1. 摘要
     if summary:
         children.append({
             "object": "block",
@@ -302,284 +229,184 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
             "callout": {
                 "rich_text": [{"text": {"content": f"📝 AI 摘要: {summary}"}}],
                 "icon": {"emoji": "🤖"},
-                "color": "blue_background"
-            }
+                "color": "blue_background",
+            },
         })
-    
-    # 2. 图片（如果有）
-    images = item.get("images", [])
-    for img_url in images[:3]:  # 最多3张
+
+    # 2. 图片
+    for img_url in item.get("images", [])[:3]:
         children.append({
             "object": "block",
             "type": "image",
-            "image": {"type": "external", "external": {"url": img_url}}
+            "image": {"type": "external", "external": {"url": img_url}},
         })
-    
-    # 3. 正文内容（如果有）
+
+    # 3. 正文
     text = item.get("text", "")
     if text:
-        # 分段，每段不超过2000字符
         paragraphs = text.split("\n")
         for para in paragraphs:
-            if para.strip():
+            if para.strip() and len(para.strip()) > 5:
                 children.append({
                     "object": "block",
                     "type": "paragraph",
                     "paragraph": {
                         "rich_text": [{"text": {"content": para.strip()[:2000]}}]
-                    }
+                    },
                 })
-    
-    # 4. 阅读原文按钮
-    children.append({
-        "object": "block",
-        "type": "divider"
-    })
+
+    # 4. 分隔符 + 原文链接
+    children.append({"object": "block", "type": "divider"})
     children.append({
         "object": "block",
         "type": "paragraph",
         "paragraph": {
             "rich_text": [
                 {"text": {"content": "📖 "}},
-                {"text": {"content": "阅读原文", "link": {"url": item["link"]}}}
+                {"text": {"content": "阅读原文", "link": {"url": item["link"]}}},
             ]
-        }
+        },
     })
-    
+
     payload = {
         "parent": {"database_id": database_id},
         "properties": properties,
-        "children": children
+        "children": children,
     }
-    
+
     try:
-        resp = requests.post(
+        r = requests.post(
             f"{NOTION_API}/pages",
-            headers={
-                "Authorization": f"Bearer {NOTION_TOKEN}",
-                "Notion-Version": NOTION_VERSION,
-                "Content-Type": "application/json"
-            },
-            json=payload
+            headers=get_notion_headers(),
+            json=payload,
+            timeout=30,
         )
-        return resp.status_code == 200
+        r.raise_for_status()
+        return True
     except Exception as e:
-        print(f"  ❌ 创建页面失败: {e}")
+        print(f"  ❌ Notion 错误: {e}")
+        if hasattr(e, 'response'):
+            try:
+                print(f"     {e.response.json()}")
+            except:
+                pass
         return False
 
 
-def cleanup_old_pages(database_id: str, days: int = 30) -> int:
-    """清理超过指定天数的旧文章"""
-    cutoff_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-    print(f"\n🧹 清理 {days} 天前的旧文章 (截止日期: {cutoff_date})")
-    
-    deleted_count = 0
-    has_more = True
-    next_cursor = None
-    
-    while has_more:
-        payload = {
-            "filter": {
-                "property": "Published",
-                "date": {"on_or_before": cutoff_date}
-            },
-            "page_size": 100
-        }
-        if next_cursor:
-            payload["start_cursor"] = next_cursor
-        
-        try:
-            resp = requests.post(
-                f"{NOTION_API}/databases/{database_id}/query",
-                headers={
-                    "Authorization": f"Bearer {NOTION_TOKEN}",
-                    "Notion-Version": NOTION_VERSION,
-                    "Content-Type": "application/json"
-                },
-                json=payload
-            )
-            
-            if resp.status_code != 200:
-                print(f"  ❌ 查询失败: {resp.status_code}")
-                break
-            
-            data = resp.json()
-            pages = data.get("results", [])
-            
-            for page in pages:
-                page_id = page["id"]
-                try:
-                    archive_resp = requests.patch(
-                        f"{NOTION_API}/pages/{page_id}",
-                        headers={
-                            "Authorization": f"Bearer {NOTION_TOKEN}",
-                            "Notion-Version": NOTION_VERSION,
-                            "Content-Type": "application/json"
-                        },
-                        json={"archived": True}
-                    )
-                    if archive_resp.status_code == 200:
-                        deleted_count += 1
-                except Exception as e:
-                    print(f"  ❌ 归档失败: {e}")
-            
-            has_more = data.get("has_more", False)
-            next_cursor = data.get("next_cursor")
-            
-        except Exception as e:
-            print(f"  ❌ 清理过程出错: {e}")
-            break
-    
-    print(f"  ✅ 已归档 {deleted_count} 篇旧文章")
-    return deleted_count
+# ========== 状态管理 ==========
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {"items": {}}
 
 
-def beautify_notion_database(database_id: str, parent_page_id: str = ""):
-    """美化 Notion 数据库"""
-    try:
-        resp = requests.patch(
-            f"{NOTION_API}/databases/{database_id}",
-            headers={
-                "Authorization": f"Bearer {NOTION_TOKEN}",
-                "Notion-Version": NOTION_VERSION,
-                "Content-Type": "application/json"
-            },
-            json={
-                "icon": {"emoji": "📰"},
-                "cover": {
-                    "type": "external",
-                    "external": {"url": "https://images.unsplash.com/photo-1586339949916-3e9457bef6d3?w=1200&h=600&fit=crop"}
-                }
-            }
-        )
-        if resp.status_code == 200:
-            print("🎨 数据库美化成功")
-    except Exception as e:
-        print(f"⚠️ 美化失败: {e}")
+def save_state(state: dict):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def make_hash(link: str) -> str:
+    return hashlib.md5(link.encode()).hexdigest()[:16]
+
+
+def is_new(state: dict, link: str) -> bool:
+    return make_hash(link) not in state.get("items", {})
 
 
 def record_item(state: dict, link: str):
-    """记录已处理的条目"""
-    fp = make_fingerprint(link)
-    state["items"][fp] = {
+    h = make_hash(link)
+    state.setdefault("items", {})[h] = {
         "link": link,
-        "processed_at": datetime.utcnow().isoformat()
+        "added_at": datetime.now().isoformat(),
     }
 
 
-def is_processed(state: dict, link: str) -> bool:
-    """检查是否已处理"""
-    fp = make_fingerprint(link)
-    return fp in state["items"]
+def cleanup_state(state: dict, days: int = 7):
+    cutoff = datetime.now() - timedelta(days=days)
+    items = state.get("items", {})
+    to_remove = []
+    for h, v in items.items():
+        try:
+            t = datetime.fromisoformat(v["added_at"])
+            if t < cutoff:
+                to_remove.append(h)
+        except:
+            pass
+    for h in to_remove:
+        del items[h]
+    return len(to_remove)
 
+
+# ========== 主流程 ==========
 
 def main():
     if not NOTION_TOKEN:
-        print("❌ 未设置 NOTION_API_KEY 环境变量")
+        print("❌ 缺少 NOTION_API_KEY")
         sys.exit(1)
 
-    config = load_config()
+    database_id = os.environ.get("NOTION_DATABASE_ID", "3c15a375-9092-815a-aa2a-c03f5286890d")
+    
+    with open(CONFIG_FILE) as f:
+        config = yaml.safe_load(f)
+
     state = load_state()
 
-    database_id = config["notion"]["database_id"]
-    if database_id == "YOUR_DATABASE_ID_HERE":
-        print("❌ 请先配置 Notion 数据库 ID")
-        sys.exit(1)
+    print("=" * 60)
+    print("📡 RSS to Notion (via rss2json proxy)")
+    print("=" * 60)
 
-    # 验证数据库
-    try:
-        get_notion_database(database_id)
-        print("✅ Notion 数据库连接成功")
-    except Exception as e:
-        print(f"❌ 数据库验证失败: {e}")
-        sys.exit(1)
-
-    # 美化数据库
-    parent_page_id = config["notion"].get("parent_page_id", "")
-    beautify_notion_database(database_id, parent_page_id)
-
-    # 抓取所有源
+    # 抓取
     all_items = []
-    for src_id, src_conf in config["rss_sources"].items():
-        if not src_conf.get("enabled", True):
+    for name, source in config.get("rss_sources", {}).items():
+        if not source.get("enabled", False):
             continue
-        print(f"\n📡 抓取: {src_conf['name']}")
-        items = fetch_rss(src_conf["url"])
-        print(f"   获取 {len(items)} 条")
+        
+        url = source["url"]
+        display_name = source.get("name", name)
+        use_proxy = source.get("use_proxy", True)
+        
+        print(f"\n📡 [{display_name}] via {'proxy' if use_proxy else 'direct'}")
+        items = fetch_rss(url, use_proxy=use_proxy)
+        print(f"  获取 {len(items)} 条")
+
         for item in items:
-            item["source_id"] = src_id
-            item["source_name"] = src_conf["name"]
-        all_items.extend(items)
+            if is_new(state, item["link"]):
+                item["source_name"] = display_name
+                all_items.append(item)
 
-    # 去重
-    new_items = [item for item in all_items if not is_processed(state, item["link"])]
-    print(f"\n📊 总计: {len(all_items)} 条, 新增: {len(new_items)} 条")
+    print(f"\n📦 共 {len(all_items)} 条新内容")
 
-    if not new_items:
-        print("ℹ️ 没有新内容")
-        # 仍然执行清理
-        cleanup_days = config.get("settings", {}).get("cleanup_days", 30)
-        if cleanup_days > 0:
-            cleanup_old_pages(database_id, cleanup_days)
-        state["last_run"] = datetime.utcnow().isoformat()
+    if not all_items:
+        print("✅ 无新内容")
+        cleanup_state(state)
         save_state(state)
         return
 
-    # 限制数量
-    max_items = config["settings"].get("max_items_per_run", 20)
-    if len(new_items) > max_items:
-        print(f"⚠️ 超出限制，只推送前 {max_items} 条")
-        new_items = new_items[:max_items]
-
-    # 生成 AI 摘要
-    ai_enabled = config.get("ai", {}).get("enabled", False) or bool(AI_API_KEY)
-    if ai_enabled:
-        print(f"\n🤖 正在生成 AI 摘要...")
-        for i, item in enumerate(new_items, 1):
-            summary = generate_summary(item["title"], item.get("text", "") + item.get("description", ""))
-            item["summary"] = summary
-            print(f"  [{i}/{len(new_items)}] {item['title'][:40]}... -> {summary[:30]}...")
-
-    # 推送前先补充全文和图片
-    print(f"\n🔍 补充全文和图片...")
-    for i, item in enumerate(new_items, 1):
-        # 如果 RSS 没有图片或内容，尝试从原文提取
-        if len(item.get('images', [])) < 1 or len(item.get('text', '')) < 100:
-            print(f"  [{i}/{len(new_items)}] 从原文提取: {item['title'][:40]}...")
-            full_text, full_images = fetch_full_content(item['link'])
-            if full_text and len(full_text) > len(item.get('text', '')):
-                item['text'] = full_text
-                print(f"    📝 更新内容: {len(full_text)} 字")
-            if full_images:
-                # 合并图片，去重
-                existing = set(item.get('images', []))
-                for img in full_images:
-                    if img not in existing:
-                        item.setdefault('images', []).append(img)
-                        existing.add(img)
-                print(f"    📷 更新图片: {len(full_images)} 张")
-
     # 推送
     success = 0
-    for i, item in enumerate(new_items, 1):
-        print(f"\n[{i}/{len(new_items)}] {item['title'][:50]}")
+    for i, item in enumerate(all_items, 1):
+        print(f"\n[{i}/{len(all_items)}] {item['title'][:50]}")
         print(f"  📷 图片: {len(item.get('images', []))} 张")
         print(f"  📝 内容: {len(item.get('text', ''))} 字")
         if create_notion_page(database_id, item, item["source_name"]):
             record_item(state, item["link"])
             success += 1
             print("  ✅ 成功")
+        else:
+            print("  ❌ 失败")
 
-    # 自动清理旧文章
-    cleanup_days = config.get("settings", {}).get("cleanup_days", 30)
-    if cleanup_days > 0:
-        cleanup_old_pages(database_id, cleanup_days)
+    print(f"\n{'=' * 60}")
+    print(f"📊 完成: {success}/{len(all_items)} 成功")
 
-    state["last_run"] = datetime.utcnow().isoformat()
+    # 清理
+    cleaned = cleanup_state(state, days=config.get("settings", {}).get("keep_days", 7))
+    if cleaned:
+        print(f"🧹 清理 {cleaned} 条旧记录")
+
     save_state(state)
-
-    print(f"\n{'='*40}")
-    print(f"🎉 完成! 成功推送 {success}/{len(new_items)} 条")
+    print("✅ 同步完成")
 
 
 if __name__ == "__main__":
