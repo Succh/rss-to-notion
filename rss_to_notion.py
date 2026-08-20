@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 import requests
 import yaml
 from bs4 import BeautifulSoup
-from readability import Document
 
 # ========== 配置 ==========
 WORKSPACE = Path(__file__).parent
@@ -108,27 +107,35 @@ def fetch_full_content(url: str) -> tuple:
         if r.status_code != 200:
             return "", []
         
-        doc = Document(r.text)
-        title = doc.short_title()
-        summary = doc.summary()
+        html = r.text
         
-        # 提取图片
-        soup = BeautifulSoup(r.text, "html.parser")
+        # 提取图片 - 优先 og:image
+        soup = BeautifulSoup(html, "html.parser")
         imgs = []
-        # 优先取 og:image
+        
+        # Open Graph 图片
         og = soup.find("meta", property="og:image")
         if og and og.get("content"):
             imgs.append(og["content"])
-        # 再取 article 内的图片
-        article = soup.find("article") or soup.find("main") or soup.find("body")
+        
+        # 文章区域图片
+        article = soup.find("article") or soup.find("main") or soup.find("div", class_="content") or soup.find("body")
         if article:
             for img in article.find_all("img")[:5]:
-                src = img.get("src", "") or img.get("data-src", "")
+                src = img.get("src", "") or img.get("data-src", "") or img.get("data-original", "")
                 if src and src.startswith("http") and src not in imgs:
-                    imgs.append(src)
+                    # 过滤掉小图标和头像
+                    if not any(x in src.lower() for x in ["avatar", "icon", "logo", "emoji", "1x1", "pixel"]):
+                        imgs.append(src)
         
-        # 提取正文文本
-        text = extract_text(summary)
+        # 提取正文
+        # 移除 script, style, nav, footer, header
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        
+        # 尝试找到文章主体
+        article = soup.find("article") or soup.find("main") or soup.find("div", class_=re.compile("content|article|post")) or soup.find("body")
+        text = extract_text(str(article)) if article else ""
         
         return text[:2000], imgs[:5]
     except Exception as e:
@@ -532,6 +539,25 @@ def main():
             summary = generate_summary(item["title"], item.get("text", "") + item.get("description", ""))
             item["summary"] = summary
             print(f"  [{i}/{len(new_items)}] {item['title'][:40]}... -> {summary[:30]}...")
+
+    # 推送前先补充全文和图片
+    print(f"\n🔍 补充全文和图片...")
+    for i, item in enumerate(new_items, 1):
+        # 如果 RSS 没有图片或内容，尝试从原文提取
+        if len(item.get('images', [])) < 1 or len(item.get('text', '')) < 100:
+            print(f"  [{i}/{len(new_items)}] 从原文提取: {item['title'][:40]}...")
+            full_text, full_images = fetch_full_content(item['link'])
+            if full_text and len(full_text) > len(item.get('text', '')):
+                item['text'] = full_text
+                print(f"    📝 更新内容: {len(full_text)} 字")
+            if full_images:
+                # 合并图片，去重
+                existing = set(item.get('images', []))
+                for img in full_images:
+                    if img not in existing:
+                        item.setdefault('images', []).append(img)
+                        existing.add(img)
+                print(f"    📷 更新图片: {len(full_images)} 张")
 
     # 推送
     success = 0
