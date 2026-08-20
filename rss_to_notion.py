@@ -201,7 +201,7 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
                     },
                 })
 
-    children.append({"object": "block", "type": "divider"})
+    children.append({"object": "block", "type": "divider", "divider": {}})
     children.append({
         "object": "block",
         "type": "paragraph",
@@ -230,6 +230,12 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
         return True
     except Exception as e:
         print(f"  ❌ Notion 错误: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                err_body = e.response.json()
+                print(f"     详情: {err_body.get('message', '')[:200]}")
+            except:
+                pass
         return False
 
 
