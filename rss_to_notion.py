@@ -36,9 +36,9 @@ HEADERS = {
 
 # ========== RSS 抓取（通过 rss2json 代理） ==========
 
-def fetch_rss_via_proxy(url: str) -> list:
+def fetch_rss_via_proxy(url: str, count: int = 5) -> list:
     """通过 rss2json.com 代理抓取 RSS，解决 GFW 问题"""
-    params = {"rss_url": url, "count": 20}
+    params = {"rss_url": url, "count": count}
     try:
         r = requests.get(RSS2JSON_API, params=params, headers=HEADERS, timeout=30)
         r.raise_for_status()
@@ -92,7 +92,7 @@ def fetch_rss_via_proxy(url: str) -> list:
         return []
 
 
-def fetch_rss_direct(url: str) -> list:
+def fetch_rss_direct(url: str, count: int = 5) -> list:
     """直接抓取 RSS（用于海外源）"""
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
@@ -107,7 +107,7 @@ def fetch_rss_direct(url: str) -> list:
         return []
 
     items = []
-    for item in channel.findall("item")[:10]:
+    for item in channel.findall("item")[:count]:
         title = item.findtext("title", "").strip()
         link = item.findtext("link", "").strip()
         desc = item.findtext("description", "") or ""
@@ -131,14 +131,14 @@ def fetch_rss_direct(url: str) -> list:
     return items
 
 
-def fetch_rss(url: str, use_proxy: bool = True) -> list:
+def fetch_rss(url: str, use_proxy: bool = True, count: int = 5) -> list:
     """智能抓取：默认通过 rss2json 代理，失败则直接抓取"""
     if use_proxy:
-        items = fetch_rss_via_proxy(url)
+        items = fetch_rss_via_proxy(url, count=count)
         if items:
             return items
         print(f"  📡 代理失败，尝试直接抓取...")
-    return fetch_rss_direct(url)
+    return fetch_rss_direct(url, count=count)
 
 
 # ========== 内容提取 ==========
@@ -351,10 +351,13 @@ def main():
     with open(CONFIG_FILE) as f:
         config = yaml.safe_load(f)
 
+    # 读取配置
+    max_items = config.get("settings", {}).get("max_items_per_source", 5)
+    
     state = load_state()
 
     print("=" * 60)
-    print("📡 RSS to Notion (via rss2json proxy)")
+    print(f"📡 RSS to Notion (每源最多 {max_items} 篇)")
     print("=" * 60)
 
     # 抓取
@@ -368,7 +371,7 @@ def main():
         use_proxy = source.get("use_proxy", True)
         
         print(f"\n📡 [{display_name}] via {'proxy' if use_proxy else 'direct'}")
-        items = fetch_rss(url, use_proxy=use_proxy)
+        items = fetch_rss(url, use_proxy=use_proxy, count=max_items)
         print(f"  获取 {len(items)} 条")
 
         for item in items:

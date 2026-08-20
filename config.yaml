@@ -48,4 +48,4 @@ rss_sources:
 
 settings:
   keep_days: 7
-  max_items_per_run: 20
+  max_items_per_source: 5
