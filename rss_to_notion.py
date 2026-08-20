@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 RSS to Notion - 通过 rss2json.com 代理抓取 RSS（绕过 GFW）
-支持 IT之家、少数派、钛媒体等国内源
+每源只抓最新 5 篇，只推新文章
 """
 
 import hashlib
@@ -12,7 +12,6 @@ import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 import yaml
@@ -34,66 +33,47 @@ HEADERS = {
 }
 
 
-# ========== RSS 抓取（通过 rss2json 代理） ==========
+# ========== RSS 抓取 ==========
 
 def fetch_rss_via_proxy(url: str, count: int = 5) -> list:
-    """通过 rss2json.com 代理抓取 RSS，解决 GFW 问题"""
+    """通过 rss2json.com 代理抓取 RSS"""
     params = {"rss_url": url}
     try:
         r = requests.get(RSS2JSON_API, params=params, headers=HEADERS, timeout=30)
         r.raise_for_status()
         data = r.json()
-    try:
-        r = requests.get(RSS2JSON_API, params=params, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        
-        if data.get("status") != "ok":
-            print(f"  ⚠️ rss2json 返回错误: {data.get('message', '未知')}")
-            return []
-        
-        items = []
-        for entry in data.get("items", [])[:count]:
-            # 提取图片（从 content HTML 中）
-            content_html = entry.get("content", "") or ""
-            images = []
-            if content_html:
-                soup = BeautifulSoup(content_html, "html.parser")
-                for img in soup.find_all("img"):
-                    src = img.get("src") or img.get("data-src") or ""
-                    if src and src.startswith("http"):
-                        images.append(src)
-            
-            # 提取纯文本
-            text = ""
-            if content_html:
-                soup = BeautifulSoup(content_html, "html.parser")
-                text = soup.get_text(separator="\n", strip=True)
-            
-            # 解析发布时间
-            pub_date = entry.get("pubDate", "")
-            
-            item = {
-                "title": entry.get("title", ""),
-                "link": entry.get("link", ""),
-                "description": entry.get("description", "") or "",
-                "text": text,
-                "images": images[:5],
-                "pub_date": pub_date,
-                "author": entry.get("author", ""),
-            }
-            
-            if item["title"] and item["link"]:
-                items.append(item)
-        
-        return items
-        
-    except requests.exceptions.Timeout:
-        print(f"  ⏰ rss2json 超时: {url}")
-        return []
     except Exception as e:
         print(f"  ❌ rss2json 错误: {e}")
         return []
+
+    if data.get("status") != "ok":
+        print(f"  ⚠️ rss2json 返回错误")
+        return []
+
+    items = []
+    for entry in data.get("items", [])[:count]:
+        content_html = entry.get("content", "") or ""
+        images = []
+        text = ""
+        if content_html:
+            soup = BeautifulSoup(content_html, "html.parser")
+            for img in soup.find_all("img"):
+                src = img.get("src") or img.get("data-src") or ""
+                if src and src.startswith("http"):
+                    images.append(src)
+            text = soup.get_text(separator="\n", strip=True)
+
+        item = {
+            "title": entry.get("title", ""),
+            "link": entry.get("link", ""),
+            "text": text,
+            "images": images[:5],
+            "pub_date": entry.get("pubDate", ""),
+        }
+        if item["title"] and item["link"]:
+            items.append(item)
+
+    return items
 
 
 def fetch_rss_direct(url: str, count: int = 5) -> list:
@@ -116,27 +96,28 @@ def fetch_rss_direct(url: str, count: int = 5) -> list:
         link = item.findtext("link", "").strip()
         desc = item.findtext("description", "") or ""
 
-        images = extract_images(desc)
-        text = extract_text(desc)
-
-        pub_date = item.findtext("pubDate", "")
+        soup = BeautifulSoup(desc, "html.parser")
+        images = []
+        for img in soup.find_all("img"):
+            src = img.get("src") or img.get("data-src") or ""
+            if src and src.startswith("http"):
+                images.append(src)
+        text = soup.get_text(separator="\n", strip=True)
 
         if title and link:
             items.append({
                 "title": title,
                 "link": link,
-                "description": desc,
                 "text": text,
                 "images": images[:5],
-                "pub_date": pub_date,
-                "author": "",
+                "pub_date": item.findtext("pubDate", ""),
             })
 
     return items
 
 
 def fetch_rss(url: str, use_proxy: bool = True, count: int = 5) -> list:
-    """智能抓取：默认通过 rss2json 代理，失败则直接抓取"""
+    """智能抓取"""
     if use_proxy:
         items = fetch_rss_via_proxy(url, count=count)
         if items:
@@ -145,48 +126,15 @@ def fetch_rss(url: str, use_proxy: bool = True, count: int = 5) -> list:
     return fetch_rss_direct(url, count=count)
 
 
-# ========== 内容提取 ==========
-
-def extract_images(html: str) -> list:
-    if not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    images = []
-    for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or ""
-        if src and src.startswith("http") and not any(
-            x in src for x in ["avatar", "icon", "logo", "emoji", "tracking", "pixel"]
-        ):
-            images.append(src)
-    return list(dict.fromkeys(images))  # 去重
-
-
-def extract_text(html: str) -> str:
-    if not html:
-        return ""
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n", strip=True)
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    # 过滤导航类文本
-    lines = [l for l in lines if len(l) > 5 or re.search(r"[\u4e00-\u9fff]", l)]
-    return "\n".join(lines)
-
-
-# ========== AI 摘要 ==========
+# ========== 摘要 ==========
 
 def generate_summary(title: str, content: str) -> str:
     if not content or len(content.strip()) < 20:
         return f"📌 {title}"
-    # 提取前 200 字
-    summary = content[:200].strip()
-    if len(content) > 200:
-        summary += "..."
-    return summary
+    return content[:200].strip() + ("..." if len(content) > 200 else "")
 
 
-# ========== Notion API ==========
+# ========== Notion ==========
 
 def get_notion_headers():
     return {
@@ -200,7 +148,6 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
     summary = generate_summary(item["title"], item.get("text", ""))
     item["summary"] = summary
 
-    # 清理标题中的非法字符
     title = re.sub(r'[\n\r\t]', ' ', item["title"])[:200]
 
     properties = {
@@ -222,10 +169,8 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
     if summary:
         properties["AI Summary"] = {"rich_text": [{"text": {"content": summary[:2000]}}]}
 
-    # 构建页面块
     children = []
 
-    # 1. 摘要
     if summary:
         children.append({
             "object": "block",
@@ -237,7 +182,6 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
             },
         })
 
-    # 2. 图片
     for img_url in item.get("images", [])[:3]:
         children.append({
             "object": "block",
@@ -245,11 +189,9 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
             "image": {"type": "external", "external": {"url": img_url}},
         })
 
-    # 3. 正文
     text = item.get("text", "")
     if text:
-        paragraphs = text.split("\n")
-        for para in paragraphs:
+        for para in text.split("\n"):
             if para.strip() and len(para.strip()) > 5:
                 children.append({
                     "object": "block",
@@ -259,7 +201,6 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
                     },
                 })
 
-    # 4. 分隔符 + 原文链接
     children.append({"object": "block", "type": "divider"})
     children.append({
         "object": "block",
@@ -289,15 +230,10 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
         return True
     except Exception as e:
         print(f"  ❌ Notion 错误: {e}")
-        if hasattr(e, 'response'):
-            try:
-                print(f"     {e.response.json()}")
-            except:
-                pass
         return False
 
 
-# ========== 状态管理 ==========
+# ========== 状态 ==========
 
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -327,7 +263,7 @@ def record_item(state: dict, link: str):
     }
 
 
-def cleanup_state(state: dict, days: int = 7):
+def cleanup_state(state: dict, days: int = 7) -> int:
     cutoff = datetime.now() - timedelta(days=days)
     items = state.get("items", {})
     to_remove = []
@@ -351,39 +287,39 @@ def main():
         sys.exit(1)
 
     database_id = os.environ.get("NOTION_DATABASE_ID", "3c15a375-9092-815a-aa2a-c03f5286890d")
-    
+
     with open(CONFIG_FILE) as f:
         config = yaml.safe_load(f)
 
-    # 读取配置
     max_items = config.get("settings", {}).get("max_items_per_source", 5)
-    
     state = load_state()
 
     print("=" * 60)
-    print(f"📡 RSS to Notion (每源最多 {max_items} 篇)")
+    print(f"📡 RSS to Notion (每源 {max_items} 篇, 仅新文章)")
     print("=" * 60)
 
-    # 抓取
     all_items = []
     for name, source in config.get("rss_sources", {}).items():
         if not source.get("enabled", False):
             continue
-        
+
         url = source["url"]
         display_name = source.get("name", name)
         use_proxy = source.get("use_proxy", True)
-        
-        print(f"\n📡 [{display_name}] via {'proxy' if use_proxy else 'direct'}")
+
+        print(f"\n📡 [{display_name}]")
         items = fetch_rss(url, use_proxy=use_proxy, count=max_items)
         print(f"  获取 {len(items)} 条")
 
+        new_count = 0
         for item in items:
             if is_new(state, item["link"]):
                 item["source_name"] = display_name
                 all_items.append(item)
+                new_count += 1
+        print(f"  新增 {new_count} 条")
 
-    print(f"\n📦 共 {len(all_items)} 条新内容")
+    print(f"\n📦 共 {len(all_items)} 条新内容待推送")
 
     if not all_items:
         print("✅ 无新内容")
@@ -391,12 +327,10 @@ def main():
         save_state(state)
         return
 
-    # 推送
     success = 0
     for i, item in enumerate(all_items, 1):
         print(f"\n[{i}/{len(all_items)}] {item['title'][:50]}")
-        print(f"  📷 图片: {len(item.get('images', []))} 张")
-        print(f"  📝 内容: {len(item.get('text', ''))} 字")
+        print(f"  📷 {len(item.get('images', []))} 张 | 📝 {len(item.get('text', ''))} 字")
         if create_notion_page(database_id, item, item["source_name"]):
             record_item(state, item["link"])
             success += 1
@@ -407,7 +341,6 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"📊 完成: {success}/{len(all_items)} 成功")
 
-    # 清理
     cleaned = cleanup_state(state, days=config.get("settings", {}).get("keep_days", 7))
     if cleaned:
         print(f"🧹 清理 {cleaned} 条旧记录")
