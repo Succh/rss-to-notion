@@ -38,7 +38,11 @@ HEADERS = {
 
 def fetch_rss_via_proxy(url: str, count: int = 5) -> list:
     """通过 rss2json.com 代理抓取 RSS，解决 GFW 问题"""
-    params = {"rss_url": url, "count": count}
+    params = {"rss_url": url}
+    try:
+        r = requests.get(RSS2JSON_API, params=params, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        data = r.json()
     try:
         r = requests.get(RSS2JSON_API, params=params, headers=HEADERS, timeout=30)
         r.raise_for_status()
@@ -49,7 +53,7 @@ def fetch_rss_via_proxy(url: str, count: int = 5) -> list:
             return []
         
         items = []
-        for entry in data.get("items", []):
+        for entry in data.get("items", [])[:count]:
             # 提取图片（从 content HTML 中）
             content_html = entry.get("content", "") or ""
             images = []
