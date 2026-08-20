@@ -325,6 +325,17 @@ def main():
                 new_count += 1
         print(f"  新增 {new_count} 条")
 
+    # 过滤低质量文章（无图且正文太短）
+    filtered = []
+    for item in all_items:
+        text_len = len(item.get("text", "").strip())
+        img_count = len(item.get("images", []))
+        if text_len < 150 and img_count == 0:
+            print(f"  ⏭️ 跳过（内容太短）: {item['title'][:40]}")
+            continue
+        filtered.append(item)
+    all_items = filtered
+
     print(f"\n📦 共 {len(all_items)} 条新内容待推送")
 
     if not all_items:
