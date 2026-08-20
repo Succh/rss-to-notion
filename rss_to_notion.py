@@ -59,8 +59,20 @@ def fetch_rss_via_proxy(url: str, count: int = 5) -> list:
             soup = BeautifulSoup(content_html, "html.parser")
             for img in soup.find_all("img"):
                 src = img.get("src") or img.get("data-src") or ""
-                if src and src.startswith("http"):
-                    images.append(src)
+                if not (src and src.startswith("http")):
+                    continue
+                # 过滤小图标、追踪像素
+                if any(x in src.lower() for x in ["icon", "logo", "avatar", "emoji", "pixel", "tracking", "1x1", "spacer"]):
+                    continue
+                w = img.get("width", "")
+                h = img.get("height", "")
+                if w and h:
+                    try:
+                        if int(w) < 80 or int(h) < 80:
+                            continue
+                    except:
+                        pass
+                images.append(src)
             text = soup.get_text(separator="\n", strip=True)
 
         item = {
@@ -131,7 +143,13 @@ def fetch_rss(url: str, use_proxy: bool = True, count: int = 5) -> list:
 def generate_summary(title: str, content: str) -> str:
     if not content or len(content.strip()) < 20:
         return f"📌 {title}"
-    return content[:200].strip() + ("..." if len(content) > 200 else "")
+    # 清理文本
+    lines = [l.strip() for l in content.split("\n") if l.strip() and len(l.strip()) > 10]
+    if not lines:
+        return f"📌 {title}"
+    # 取前两行非空文本
+    summary = " ".join(lines[:2])[:200]
+    return summary.strip()
 
 
 # ========== Notion ==========
@@ -213,11 +231,20 @@ def create_notion_page(database_id: str, item: dict, source_name: str) -> bool:
         },
     })
 
+    # 设置封面图
+    cover = None
+    for img_url in item.get("images", [])[:1]:
+        if img_url and img_url.startswith("http"):
+            cover = {"type": "external", "external": {"url": img_url}}
+            break
+
     payload = {
         "parent": {"database_id": database_id},
         "properties": properties,
         "children": children,
     }
+    if cover:
+        payload["cover"] = cover
 
     try:
         r = requests.post(
