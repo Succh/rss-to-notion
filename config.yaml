@@ -21,6 +21,12 @@ rss_sources:
     url: https://www.tmtpost.com/rss.xml
     use_proxy: true
 
+  fuliba:
+    enabled: true
+    name: 福利吧
+    url: https://www.fuliba2023.net/feed
+    use_proxy: true
+
   # ========== 海外源（直接抓取） ==========
   hackernews:
     enabled: true
